@@ -1,0 +1,302 @@
+diff --git a/langfuse/langchain/CallbackHandler.py b/langfuse/langchain/CallbackHandler.py
+--- a/langfuse/langchain/CallbackHandler.py
++++ b/langfuse/langchain/CallbackHandler.py
+@@ -1,3 +1,4 @@
++from asyncio import CancelledError
+ from collections import OrderedDict
+ from contextvars import Token
+ from dataclasses import dataclass, field
+@@ -331,6 +332,13 @@
+     def _get_error_level_and_status_message(
+         self, error: BaseException
+     ) -> tuple[Literal["DEFAULT", "ERROR"], str]:
++        if isinstance(error, CancelledError):
++            message = str(error)
++            return (
++                "ERROR",
++                f"CancelledError: {message}" if message else "CancelledError",
++            )
++
+         # LangGraph uses GraphBubbleUp subclasses for expected control flow such as
+         # interrupts and handoffs, so they should stay visible without being errors.
+         if any(isinstance(error, t) for t in CONTROL_FLOW_EXCEPTION_TYPES):
+@@ -1356,7 +1364,9 @@
+                         level,
+                     ),
+                     input=kwargs.get("inputs"),
+-                    cost_details={"total": 0},
++                    cost_details=None
++                    if isinstance(error, CancelledError)
++                    else {"total": 0},
+                 ).end()
+ 
+                 if parent_run_id is None and level == "DEFAULT":
+@@ -1369,6 +1379,7 @@
+         except Exception as e:
+             langfuse_logger.exception(e)
+         finally:
++            self._updated_completion_start_time_memo.discard(run_id)
+             if parent_run_id is None:
+                 self._reset(run_id)
+ 
+diff --git a/tests/unit/test_langchain.py b/tests/unit/test_langchain.py
+--- a/tests/unit/test_langchain.py
++++ b/tests/unit/test_langchain.py
+@@ -1,16 +1,26 @@
++import asyncio
+ import importlib
++import time
+ from contextvars import copy_context
+ from unittest.mock import patch
+ from uuid import uuid4
+ 
+ import pytest
+-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
++from langchain_core.language_models import BaseChatModel
++from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+ from langchain_core.output_parsers import StrOutputParser
+-from langchain_core.outputs import ChatGeneration, ChatResult, Generation, LLMResult
++from langchain_core.outputs import (
++    ChatGeneration,
++    ChatGenerationChunk,
++    ChatResult,
++    Generation,
++    LLMResult,
++)
+ from langchain_core.prompts import ChatPromptTemplate
+ from langchain_core.tools import StructuredTool
+ from langchain_openai import ChatOpenAI, OpenAI
+ from opentelemetry import context as otel_context
++from opentelemetry import trace as trace_api
+ from pydantic import BaseModel, Field
+ 
+ from langfuse._client.attributes import LangfuseOtelSpanAttributes
+@@ -40,6 +50,228 @@
+ 
+ def _has_run_state(handler, run_id) -> bool:
+     return run_id in handler._run_states
++
++
++@pytest.mark.parametrize("error_message", ["", "requested cancellation"])
++def test_cancelled_llm_error_preserves_unknown_cost_and_sibling_runs(
++    langfuse_memory_client, find_spans, get_span, error_message
++):
++    handler = CallbackHandler()
++    (
++        root,
++        cancelled_branch,
++        sibling_branch,
++        cancelled_llm,
++        other_cancelled_llm,
++        sibling_llm,
++    ) = (uuid4() for _ in range(6))
++    with trace_api.use_span(trace_api.get_current_span(), end_on_exit=False):
++        handler.on_chain_start({"name": "root"}, {}, run_id=root)
++        handler.on_chain_start(
++            {"name": "cancelled-branch"},
++            {},
++            run_id=cancelled_branch,
++            parent_run_id=root,
++        )
++        handler.on_chat_model_start(
++            {"name": "cancelled-generation"},
++            [[HumanMessage(content="cancel")]],
++            run_id=cancelled_llm,
++            parent_run_id=cancelled_branch,
++            invocation_params={},
++        )
++        handler.on_llm_new_token(
++            "partial", run_id=cancelled_llm, parent_run_id=cancelled_branch
++        )
++        handler.on_chat_model_start(
++            {"name": "other-cancelled-generation"},
++            [[HumanMessage(content="cancel together")]],
++            run_id=other_cancelled_llm,
++            parent_run_id=cancelled_branch,
++            invocation_params={},
++        )
++        handler.on_chain_start(
++            {"name": "sibling-branch"}, {}, run_id=sibling_branch, parent_run_id=root
++        )
++        handler.on_chat_model_start(
++            {"name": "sibling-generation"},
++            [[HumanMessage(content="continue")]],
++            run_id=sibling_llm,
++            parent_run_id=sibling_branch,
++            invocation_params={},
++        )
++        sibling_span = trace_api.get_current_span()
++        handler.on_llm_error(
++            asyncio.CancelledError(error_message),
++            run_id=cancelled_llm,
++            parent_run_id=cancelled_branch,
++        )
++        assert sibling_span.is_recording()
++        assert cancelled_llm not in handler._updated_completion_start_time_memo
++        handler.on_llm_error(
++            asyncio.CancelledError(),
++            run_id=other_cancelled_llm,
++            parent_run_id=cancelled_branch,
++        )
++        handler.on_chain_error(
++            asyncio.CancelledError(), run_id=cancelled_branch, parent_run_id=root
++        )
++        # A delayed terminal callback must not publish the generation twice.
++        handler.on_llm_error(
++            asyncio.CancelledError(),
++            run_id=cancelled_llm,
++            parent_run_id=cancelled_branch,
++        )
++        handler.on_llm_end(
++            LLMResult(
++                generations=[[ChatGeneration(message=AIMessage(content="late result"))]]
++            ),
++            run_id=cancelled_llm,
++            parent_run_id=cancelled_branch,
++        )
++        handler.on_llm_end(
++            LLMResult(
++                generations=[[ChatGeneration(message=AIMessage(content="done"))]]
++            ),
++            run_id=sibling_llm,
++            parent_run_id=sibling_branch,
++        )
++        handler.on_chain_end({}, run_id=sibling_branch, parent_run_id=root)
++        handler.on_chain_error(asyncio.CancelledError(), run_id=root)
++
++    langfuse_memory_client.flush()
++    assert len(find_spans("cancelled-generation")) == 1
++    assert len(find_spans("other-cancelled-generation")) == 1
++    assert len(find_spans("sibling-generation")) == 1
++    assert get_span("sibling-generation").status.status_code.name == "UNSET"
++    for name in ("cancelled-generation", "other-cancelled-generation"):
++        span = get_span(name)
++        assert span.status.status_code.name == "ERROR"
++        assert span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_LEVEL] == "ERROR"
++        expected_status = (
++            "CancelledError: " + error_message
++            if name == "cancelled-generation" and error_message
++            else "CancelledError"
++        )
++        assert (
++            span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE]
++            == expected_status
++        )
++        assert LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT not in span.attributes
++        assert (
++            LangfuseOtelSpanAttributes.OBSERVATION_USAGE_DETAILS not in span.attributes
++        )
++        assert (
++            LangfuseOtelSpanAttributes.OBSERVATION_COST_DETAILS not in span.attributes
++        )
++    assert not handler._runs
++    assert not handler._context_tokens
++
++
++def test_cancelled_llm_error_preserves_recorded_partial_facts(
++    langfuse_memory_client, get_span, json_attr
++):
++    handler = CallbackHandler()
++    run_id = uuid4()
++    with trace_api.use_span(trace_api.get_current_span(), end_on_exit=False):
++        handler.on_chat_model_start(
++            {"name": "partial-generation"},
++            [[HumanMessage(content="stream")]],
++            run_id=run_id,
++            invocation_params={},
++        )
++        langfuse_memory_client.update_current_generation(
++            output="observed partial text",
++            usage_details={"input": 3},
++            cost_details={"input": 0.1},
++        )
++        handler.on_llm_error(asyncio.CancelledError(), run_id=run_id)
++    langfuse_memory_client.flush()
++    span = get_span("partial-generation")
++    assert (
++        span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]
++        == "observed partial text"
++    )
++    assert json_attr(span, LangfuseOtelSpanAttributes.OBSERVATION_USAGE_DETAILS) == {
++        "input": 3
++    }
++    assert json_attr(span, LangfuseOtelSpanAttributes.OBSERVATION_COST_DETAILS) == {
++        "input": 0.1
++    }
++
++
++def test_cancelled_async_model_stream_exports_generation_without_inventing_cost(
++    langfuse_memory_client, get_span
++):
++    handler = CallbackHandler()
++    handler.run_inline = True
++    interrupted = {}
++
++    async def run():
++        started = asyncio.Event()
++
++        class StreamingChatModel(BaseChatModel):
++            @property
++            def _llm_type(self):
++                return "local-stream-cancellation-test"
++
++            def _generate(self, messages, stop=None, run_manager=None, **kwargs):
++                raise NotImplementedError
++
++            async def _astream(self, messages, stop=None, run_manager=None, **kwargs):
++                try:
++                    yield ChatGenerationChunk(message=AIMessageChunk(content="partial"))
++                    await asyncio.Future()
++                except asyncio.CancelledError:
++                    interrupted["at"] = time.time_ns()
++                    raise
++
++        async def consume():
++            with langfuse_memory_client.start_as_current_observation(
++                name="stream-parent"
++            ):
++                parent = trace_api.get_current_span()
++                try:
++                    with trace_api.use_span(
++                        parent,
++                        end_on_exit=False,
++                        record_exception=False,
++                        set_status_on_exception=False,
++                    ):
++                        async for _ in StreamingChatModel().astream(
++                            [HumanMessage(content="stream")],
++                            config={
++                                "callbacks": [handler],
++                                "run_name": "stream-generation",
++                            },
++                        ):
++                            started.set()
++                finally:
++                    assert trace_api.get_current_span() is parent
++                    assert parent.is_recording()
++
++        task = asyncio.create_task(consume())
++        await started.wait()
++        task.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++
++    asyncio.run(run())
++    langfuse_memory_client.flush()
++    span = get_span("stream-generation")
++    _assert_parent_child(get_span("stream-parent"), span)
++    assert span.end_time >= interrupted["at"]
++    assert span.status.status_code.name == "ERROR"
++    assert (
++        span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE]
++        == "CancelledError"
++    )
++    assert LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT not in span.attributes
++    assert LangfuseOtelSpanAttributes.OBSERVATION_USAGE_DETAILS not in span.attributes
++    assert LangfuseOtelSpanAttributes.OBSERVATION_COST_DETAILS not in span.attributes
++    assert not handler._updated_completion_start_time_memo
++    assert not handler._runs
++    assert not handler._context_tokens
+ 
+ 
+ def test_chat_model_callback_exports_generation_span(

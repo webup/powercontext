@@ -1,0 +1,5 @@
+{
+  "test_callback_cancellation.py": "6dfa65fa31831255f965f2ea81466af488f8b3b8f202a08b800e651f228d70d5",
+  "langchain-core-1.7.6-cancellation.patch": "6b743ad4dbd9d147e295357bff89ea5c8082decdab23ca7b7cbf3351d76c72db",
+  "langfuse5-cancel-generation-fix.patch": "f77289fec8c039c8cfaff388a6033e45cf08d2e41c0b038899ac2bba5036e52f"
+}

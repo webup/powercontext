@@ -1,0 +1,378 @@
+--- a/libs/core/langchain_core/language_models/chat_models.py
++++ b/libs/core/langchain_core/language_models/chat_models.py
+@@ -1848,18 +1848,56 @@
+         input_messages = [
+             _normalize_messages(message_list) for message_list in messages
+         ]
+-        results = await asyncio.gather(
+-            *[
++        generation_tasks = [
++            asyncio.create_task(
+                 self._agenerate_with_cache(
+                     m,
+                     stop=stop,
+                     run_manager=run_managers[i] if run_managers else None,
+                     **kwargs,
+                 )
+-                for i, m in enumerate(input_messages)
+-            ],
+-            return_exceptions=True,
+-        )
++            )
++            for i, m in enumerate(input_messages)
++        ]
++        try:
++            results = await asyncio.gather(*generation_tasks, return_exceptions=True)
++        except asyncio.CancelledError:
++            # An externally cancelled gather does not return its child outcomes.
++            # Notify only these owned, finished runs; other invocations sharing
++            # a callback handler can still be active and must remain untouched.
++            terminal_events = []
++            for run_manager, task in zip(run_managers, generation_tasks, strict=False):
++                if not task.done():
++                    continue
++                try:
++                    result = task.result()
++                except BaseException as error:
++                    terminal_events.append(
++                        run_manager.on_llm_error(
++                            error,
++                            response=LLMResult(
++                                generations=[_generate_response_from_error(error)]
++                            ),
++                        )
++                    )
++                else:
++                    terminal_events.append(
++                        run_manager.on_llm_end(
++                            LLMResult(
++                                generations=[result.generations],
++                                llm_output=result.llm_output,
++                            )
++                        )
++                    )
++            # Dispatch every terminal event before waiting. Callback failures
++            # must not replace cancellation, and a repeated cancel may interrupt
++            # the wait without cancelling the already scheduled notifications.
++            cleanup = asyncio.gather(*terminal_events, return_exceptions=True)
++            try:
++                await asyncio.shield(cleanup)
++            except asyncio.CancelledError:
++                pass
++            raise
+         exceptions = []
+         for i, res in enumerate(results):
+             if isinstance(res, BaseException):
+@@ -1883,7 +1921,7 @@
+                             )
+                         )
+                         for run_manager, res in zip(run_managers, results, strict=False)
+-                        if not isinstance(res, Exception)
++                        if not isinstance(res, BaseException)
+                     ]
+                 )
+             raise exceptions[0]
+--- /dev/null
++++ b/libs/core/tests/unit_tests/language_models/chat_models/test_agenerate_cancellation.py
+@@ -0,0 +1,301 @@
++"""Actual core lifecycle regressions; no provider or SDK private-run edits."""
++
++import asyncio
++from typing import Any
++
++import pytest
++from langchain_core.callbacks import AsyncCallbackHandler
++from langchain_core.language_models import BaseChatModel
++from langchain_core.messages import AIMessage, HumanMessage
++from langchain_core.outputs import ChatGeneration, ChatResult
++from langchain_core.runnables import RunnableLambda, RunnableParallel
++
++
++class Lifecycle(AsyncCallbackHandler):
++    run_inline = True
++
++    def __init__(self) -> None:
++        self.labels = {}
++        self.errors = []
++        self.error_messages = []
++        self.ends = []
++        self.chain_errors = []
++        self.terminal = asyncio.Event()
++
++    async def on_chat_model_start(
++        self, serialized: Any, messages: Any, *, run_id: Any, **kwargs: Any
++    ) -> None:
++        self.labels[run_id] = messages[0][-1].content
++
++    async def on_llm_error(
++        self, error: BaseException, *, run_id: Any, **kwargs: Any
++    ) -> None:
++        self.errors.append((self.labels[run_id], type(error), run_id))
++        self.error_messages.append(str(error))
++        self.terminal.set()
++
++    async def on_llm_end(self, response: Any, *, run_id: Any, **kwargs: Any) -> None:
++        self.ends.append(
++            (self.labels[run_id], response.generations[0][0].message.content, run_id)
++        )
++        self.terminal.set()
++
++    async def on_chain_error(
++        self,
++        error: BaseException,
++        *,
++        run_id: Any,
++        parent_run_id: Any = None,
++        **kwargs: Any,
++    ) -> None:
++        self.chain_errors.append((type(error), run_id, parent_run_id))
++
++
++class ControlledModel(BaseChatModel):
++    controls: Any
++
++    @property
++    def _llm_type(self) -> str:
++        return "deterministic-cancellation-lifecycle"
++
++    def _generate(self, *args: Any, **kwargs: Any) -> ChatResult:
++        raise AssertionError("The regression must exercise native async generation")
++
++    async def _agenerate(
++        self, messages: Any, stop: Any = None, run_manager: Any = None, **kwargs: Any
++    ) -> ChatResult:
++        label = messages[-1].content
++        started = self.controls.setdefault(label, asyncio.Event())
++        started.set()
++        if label.startswith("block") or label == "ignore-cancel":
++            try:
++                await asyncio.Future()
++            except asyncio.CancelledError:
++                if label != "ignore-cancel":
++                    raise
++                self.controls["ignored_cancel"] = True
++        elif label == "self-cancel":
++            raise asyncio.CancelledError("only this input cancels")
++        elif label == "keep-running":
++            await self.controls["release"].wait()
++        result = ChatResult(
++            generations=[
++                ChatGeneration(message=AIMessage(content="completed " + label))
++            ]
++        )
++        self.controls.setdefault("completed-" + label, asyncio.Event()).set()
++        return result
++
++
++def test_direct_ainvoke_cancellation_ends_its_started_llm_run() -> None:
++    async def run() -> None:
++        controls = {"block": asyncio.Event()}
++        callback = Lifecycle()
++        model = ControlledModel(controls=controls)
++        task = asyncio.create_task(
++            model.ainvoke("block", config={"callbacks": [callback]})
++        )
++        await controls["block"].wait()
++        task.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++        assert [(label, error) for label, error, _ in callback.errors] == [
++            ("block", asyncio.CancelledError)
++        ]
++        assert not callback.ends
++        assert len(callback.labels) == 1
++
++    asyncio.run(run())
++
++
++def test_batch_self_cancel_preserves_success_and_cancellation_type() -> None:
++    async def run() -> None:
++        callback = Lifecycle()
++        model = ControlledModel(controls={})
++        with pytest.raises(asyncio.CancelledError):
++            await model.agenerate(
++                [[HumanMessage(content=label)] for label in ["self-cancel", "success"]],
++                callbacks=[callback],
++            )
++        assert [(label, error) for label, error, _ in callback.errors] == [
++            ("self-cancel", asyncio.CancelledError)
++        ]
++        assert [(label, result) for label, result, _ in callback.ends] == [
++            ("success", "completed success")
++        ]
++
++    asyncio.run(run())
++
++
++@pytest.mark.parametrize("other", ["success", "ignore-cancel"])
++def test_outer_batch_cancel_notifies_actual_child_outcomes_once(other: str) -> None:
++    async def run() -> None:
++        controls = {"block": asyncio.Event(), other: asyncio.Event()}
++        callback = Lifecycle()
++        model = ControlledModel(controls=controls)
++        task = asyncio.create_task(
++            model.agenerate(
++                [[HumanMessage(content=label)] for label in ["block", other]],
++                callbacks=[callback],
++            )
++        )
++        await controls["block"].wait()
++        await controls[other].wait()
++        if other == "success":
++            while not controls.get("completed-success", asyncio.Event()).is_set():
++                await asyncio.sleep(0)
++        task.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++        assert [(label, error) for label, error, _ in callback.errors] == [
++            ("block", asyncio.CancelledError)
++        ]
++        assert [(label, result) for label, result, _ in callback.ends] == [
++            (other, "completed " + other)
++        ]
++        assert len({rid for _, _, rid in callback.errors + callback.ends}) == 2
++        if other == "ignore-cancel":
++            assert controls["ignored_cancel"]
++
++    asyncio.run(run())
++
++
++def test_real_runnable_parallel_child_cancel_keeps_other_generation_running() -> None:
++    async def run() -> None:
++        controls = {"keep-running": asyncio.Event(), "release": asyncio.Event()}
++        callback = Lifecycle()
++        model = ControlledModel(controls=controls)
++
++        async def cancel_only_this_branch(value: Any) -> None:
++            await controls["keep-running"].wait()
++            raise asyncio.CancelledError("branch A only")
++
++        runnable = RunnableParallel(
++            cancel=RunnableLambda(cancel_only_this_branch), live=model
++        )
++        with pytest.raises(asyncio.CancelledError):
++            await runnable.ainvoke("keep-running", config={"callbacks": [callback]})
++        assert any(
++            error is asyncio.CancelledError and parent is None
++            for error, _, parent in callback.chain_errors
++        )
++        assert not callback.ends and not callback.errors
++        controls["release"].set()
++        await asyncio.wait_for(callback.terminal.wait(), 1)
++        assert [(label, result) for label, result, _ in callback.ends] == [
++            ("keep-running", "completed keep-running")
++        ]
++        assert not callback.errors
++        await asyncio.sleep(0)
++
++    asyncio.run(run())
++
++
++@pytest.mark.parametrize("fail_at", ["error", "end"])
++def test_outer_cancel_type_and_child_reason_survive_callback_failure(
++    fail_at: str,
++) -> None:
++    class RaisingLifecycle(Lifecycle):
++        raise_error = True
++
++        async def on_llm_error(
++            self, error: BaseException, *, run_id: Any, **kwargs: Any
++        ) -> None:
++            await super().on_llm_error(error, run_id=run_id, **kwargs)
++            if fail_at == "error":
++                raise RuntimeError("callback fixture failure")
++
++        async def on_llm_end(
++            self, response: Any, *, run_id: Any, **kwargs: Any
++        ) -> None:
++            await super().on_llm_end(response, run_id=run_id, **kwargs)
++            if fail_at == "end":
++                raise RuntimeError("callback fixture failure")
++
++    async def run() -> None:
++        controls = {"block": asyncio.Event(), "success": asyncio.Event()}
++        callback = RaisingLifecycle()
++        model = ControlledModel(controls=controls)
++        labels = ["block"] if fail_at == "error" else ["block", "success"]
++        task = asyncio.create_task(
++            model.agenerate(
++                [[HumanMessage(content=label)] for label in labels],
++                callbacks=[callback],
++            )
++        )
++        await controls["block"].wait()
++        if "success" in labels:
++            while not controls.get("completed-success", asyncio.Event()).is_set():
++                await asyncio.sleep(0)
++        task.cancel("original user cancellation")
++        with pytest.raises(asyncio.CancelledError) as raised:
++            await task
++        if fail_at == "error":
++            assert str(raised.value) == "original user cancellation"
++        # asyncio.gather can lose the outer message in mixed batches; retain
++        # that baseline behavior while preserving each child's actual error.
++        assert callback.error_messages == (
++            [""] if fail_at == "error" else ["original user cancellation"]
++        )
++        assert [label for label, _, _ in callback.errors] == ["block"]
++        assert [label for label, _, _ in callback.ends] == (
++            [] if fail_at == "error" else ["success"]
++        )
++
++    asyncio.run(run())
++
++
++def test_repeated_cancel_keeps_original_reason_and_all_terminal_notifications() -> None:
++    class DelayedLifecycle(Lifecycle):
++        def __init__(self) -> None:
++            super().__init__()
++            self.entered = set()
++            self.all_entered = asyncio.Event()
++            self.release = asyncio.Event()
++            self.finished = asyncio.Event()
++
++        async def on_llm_error(
++            self, error: BaseException, *, run_id: Any, **kwargs: Any
++        ) -> None:
++            self.entered.add(run_id)
++            if len(self.entered) == 2:
++                self.all_entered.set()
++            await self.release.wait()
++            await super().on_llm_error(error, run_id=run_id, **kwargs)
++            if len(self.errors) == 2:
++                self.finished.set()
++
++    async def run() -> None:
++        controls = {"block-a": asyncio.Event(), "block-b": asyncio.Event()}
++        callback = DelayedLifecycle()
++        model = ControlledModel(controls=controls)
++        task = asyncio.create_task(
++            model.agenerate(
++                [[HumanMessage(content=label)] for label in ["block-a", "block-b"]],
++                callbacks=[callback],
++            )
++        )
++        await controls["block-a"].wait()
++        await controls["block-b"].wait()
++        task.cancel("original user cancellation")
++        try:
++            await asyncio.wait_for(callback.all_entered.wait(), 1)
++        except TimeoutError:
++            pytest.fail("cancelled LLM runs never received terminal callbacks")
++        task.cancel("second cancellation during callback cleanup")
++        with pytest.raises(asyncio.CancelledError) as raised:
++            await task
++        assert str(raised.value) == "original user cancellation"
++        assert not callback.errors
++        callback.release.set()
++        await asyncio.wait_for(callback.finished.wait(), 1)
++        assert sorted(label for label, _, _ in callback.errors) == [
++            "block-a",
++            "block-b",
++        ]
++        assert len({run_id for _, _, run_id in callback.errors}) == 2
++        assert sorted(callback.error_messages) == ["", "original user cancellation"]
++        assert not callback.ends
++        await asyncio.sleep(0)
++
++    asyncio.run(run())
